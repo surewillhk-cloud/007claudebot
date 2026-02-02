@@ -1,4 +1,5 @@
-import os, io, re, logging, secrets, string, httpx
+import os, io, re, logging, secrets, string, httpx, json
+from datetime import datetime, timedelta
 from openai import OpenAI
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -7,158 +8,171 @@ from telegram.constants import ParseMode
 # --- 核心配置 ---
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
-KEFU_URL = "https://t.me/your_telegram_id" # 可以在这里改你的客服链接
+ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
+KEFU_URL = "https://t.me/your_telegram_id" # 记得改这里
+DB_FILE = "users_db.json"
 
-# 内部运行状态
-current_model = "anthropic/claude-3.7-sonnet:thinking"
-authorized_users = {int(ADMIN_ID)} if ADMIN_ID else set()
-valid_keys = {}
+# 模型映射
+MODELS = {
+    "💰 3.7 Sonnet (省钱)": "anthropic/claude-3.7-sonnet:thinking",
+    "💎 4.5 Opus (土豪)": "anthropic/claude-4.5-opus",
+    "🧠 GPT-4o (通用)": "openai/gpt-4o",
+    "🚀 o1 (推理版)": "openai/o1"
+}
 
-# 强制合并输出，防止文件太碎
-SYSTEM_PROMPT = """你是一个专业的全栈工程师。
-1. 请提供完整、可直接运行的代码。
-2. 请将修复后的代码合并到一个完整的文件中输出，不要拆分成多个代码块。
-3. 代码块第一行必须是：# filename: 文件名.扩展名
-"""
+# --- 数据库持久化 ---
+def load_db():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r') as f: return json.load(f)
+        except: pass
+    return {"users": {}, "keys": {}}
 
+def save_db(data):
+    with open(DB_FILE, 'w') as f: json.dump(data, f)
+
+db = load_db()
 logging.basicConfig(level=logging.INFO)
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
 
-# --- 菜单逻辑 ---
-def get_menu(uid):
-    """根据身份返回不同的底部菜单"""
-    is_admin = str(uid) == str(ADMIN_ID)
-    is_auth = uid in authorized_users
+# --- 菜单生成器 ---
+def get_main_menu(uid):
+    is_admin = (uid == ADMIN_ID)
+    is_auth = str(uid) in db["users"]
     
     if is_admin:
         return ReplyKeyboardMarkup([
-            ["💰 切换 3.7 (省钱)", "💎 切换 4.5 (土豪)"],
-            ["🔑 生成激活码", "💳 查看余额"],
-            ["🛑 停止思考", "☎️ 联系客服"]
+            ["💰 3.7 Sonnet (省钱)", "💎 4.5 Opus (土豪)"],
+            ["🧠 GPT-4o (通用)", "🚀 o1 (推理版)"],
+            ["🔑 生成30天密钥", "💳 查看余额"],
+            ["🛑 停止/清理", "☎️ 联系客服"]
         ], resize_keyboard=True)
     elif is_auth:
         return ReplyKeyboardMarkup([
-            ["💰 3.7 (省钱)", "💎 4.5 (土豪)"],
-            ["🛑 停止思考", "☎️ 联系客服"]
+            ["💰 3.7 Sonnet (省钱)", "💎 4.5 Opus (土豪)"],
+            ["🛑 停止/清理", "☎️ 联系客服"]
         ], resize_keyboard=True)
     else:
-        # 陌生人看到的菜单
+        # 陌生人只有这两个按钮
         return ReplyKeyboardMarkup([["✨ 申请授权", "☎️ 联系客服"]], resize_keyboard=True)
 
-async def get_balance():
-    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.get("https://openrouter.ai/api/v1/key", headers=headers, timeout=5)
-            return r.json()['data']['limit_remaining']
-        except: return "查询失败"
-
-# --- 核心指令处理 ---
+# --- 功能逻辑 ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    menu = get_menu(uid)
-    msg = "🚀 欢迎使用私人 AI 编程助手！\n\n"
-    if uid not in authorized_users and str(uid) != str(ADMIN_ID):
-        msg += "⚠️ 您当前未获得授权。请输入激活码或点击下方按钮联系客服。"
+    menu = get_main_menu(uid)
+    
+    if str(uid) not in db["users"] and uid != ADMIN_ID:
+        # 陌生人：展示带内联按钮的消息
+        keyboard = [[InlineKeyboardButton("📩 点击此处私聊客服申请", url=KEFU_URL)]]
+        await update.message.reply_text(
+            "👋 欢迎！这是私人 AI 编程助手。\n\n⚠️ 您尚未获得授权。请点击下方按钮联系客服，或在下方输入框发送您的激活码。",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        # 同时弹出底部简单菜单
+        await update.message.reply_text("您也可以点击下方菜单查看申请指引：", reply_markup=menu)
     else:
-        msg += f"✅ 状态：已授权\n🎯 当前模型：{current_model}"
-    await update.message.reply_text(msg, reply_markup=menu)
+        await update.message.reply_text("✅ 欢迎回来！请选择模型或直接提问。", reply_markup=menu)
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_model
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    text = update.message.text.strip() if update.message.text else ""
+    text = update.message.text.strip()
 
-    # 1. 处理激活码
-    if text in valid_keys:
-        authorized_users.add(uid)
-        del valid_keys[text]
-        await update.message.reply_text("🎉 激活成功！全功能菜单已开启。", reply_markup=get_menu(uid))
+    # 1. 自动识别密钥 (KEY-XXXXX 格式)
+    if text.startswith("KEY-"):
+        if text in db["keys"]:
+            days = db["keys"].pop(text)
+            expire_at = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+            db["users"][str(uid)] = expire_at
+            save_db(db)
+            await update.message.reply_text(f"🎉 激活成功！有效期至：{expire_at}", reply_markup=get_main_menu(uid))
+        else:
+            await update.message.reply_text("❌ 密钥无效或已过期。")
         return
 
-    # 2. 处理菜单按钮
-    if text == "💰 切换 3.7 (省钱)":
-        current_model = "anthropic/claude-3.7-sonnet:thinking"
-        await update.message.reply_text("已切换至 3.7 Sonnet (高性价比)")
+    # 2. 菜单项拦截
+    if text in MODELS:
+        context.user_data["model"] = MODELS[text]
+        await update.message.reply_text(f"🎯 模型已切换：{text}")
         return
-    if text == "💎 切换 4.5 (土豪)":
-        current_model = "anthropic/claude-4.5-opus"
-        await update.message.reply_text("已切换至 4.5 Opus (请注意余额消耗)")
+    
+    if text == "🔑 生成30天密钥" and uid == ADMIN_ID:
+        new_key = "KEY-" + ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+        db["keys"][new_key] = 30
+        save_db(db)
+        await update.message.reply_text(f"🔑 已生成30天密钥：\n`{new_key}`", parse_mode='Markdown')
         return
+
     if text == "💳 查看余额":
-        bal = await get_balance()
-        await update.message.reply_text(f"💰 账户剩余：<b>${bal}</b>", parse_mode='HTML')
+        headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+        async with httpx.AsyncClient() as c:
+            r = await c.get("https://openrouter.ai/api/v1/key", headers=headers)
+            bal = r.json()['data']['limit_remaining']
+            await update.message.reply_text(f"💰 账户余额：<b>${bal}</b>", parse_mode='HTML')
         return
-    if text == "🔑 生成激活码" and str(uid) == str(ADMIN_ID):
-        key = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(12))
-        valid_keys[key] = uid
-        await update.message.reply_text(f"🔑 新密钥：`{key}`\n(直接发给用户即可)", parse_mode='Markdown')
-        return
-    if text == "🛑 停止思考":
+
+    if text == "🛑 停止/清理":
         context.user_data.clear()
-        await update.message.reply_text("⏹ 已强制中断并清理上下文。")
+        await update.message.reply_text("⏹ 已重置话题上下文，思考已停止。")
         return
+
     if text in ["☎️ 联系客服", "✨ 申请授权"]:
-        await update.message.reply_text(f"请联系管理员申请授权：\n{KEFU_URL}")
+        keyboard = [[InlineKeyboardButton("📩 联系客服", url=KEFU_URL)]]
+        await update.message.reply_text("点击下方按钮跳转至客服：", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    # 3. 权限校验
-    if uid not in authorized_users and str(uid) != str(ADMIN_ID):
-        await start(update, context)
-        return
+    # 3. 鉴权与到期检查
+    if uid != ADMIN_ID:
+        if str(uid) not in db["users"]:
+            await start(update, context)
+            return
+        expire_time = datetime.strptime(db["users"][str(uid)], "%Y-%m-%d %H:%M:%S")
+        if expire_time < datetime.now():
+            del db["users"][str(uid)]
+            save_db(db)
+            await update.message.reply_text("⏰ 您的30天授权已到期，请重新申请。")
+            return
 
-    # 4. 调用 AI
-    await process_ai(update, context, text)
+    # 4. AI 逻辑 (含话题延续)
+    await run_ai_logic(update, context, text)
 
-async def process_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    status_msg = await update.message.reply_text(f"🔍 {current_model.split('/')[-1]} 正在思考...")
+async def run_ai_logic(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    # 初始化历史纪录
+    if "history" not in context.user_data: context.user_data["history"] = []
+    context.user_data["history"].append({"role": "user", "content": prompt})
+    
+    model = context.user_data.get("model", MODELS["💰 3.7 Sonnet (省钱)"])
+    status_msg = await update.message.reply_text(f"🔍 {model.split('/')[-1]} 思考中...")
+    
     try:
         response = client.chat.completions.create(
-            model=current_model,
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+            model=model,
+            messages=[{"role": "system", "content": "你是一个全能专家，请尽可能合并代码输出。"}] + context.user_data["history"][-6:] # 记住最近3轮对话
         )
-        reply = response.choices[0].message.content
+        ans = response.choices[0].message.content
+        context.user_data["history"].append({"role": "assistant", "content": ans})
         
-        # 提取并发送文件
-        blocks = re.findall(r"```(?:\w+)?\n([\s\S]*?)\n```", reply)
-        # 过滤掉正文中的长代码，让对话框清爽
-        text_only = re.sub(r"```(?:\w+)?\n[\s\S]*?\n```", "【代码已打包为下方文件】", reply)
+        # 提取文件
+        blocks = re.findall(r"```(?:\w+)?\n([\s\S]*?)\n```", ans)
+        clean_text = re.sub(r"```(?:\w+)?\n[\s\S]*?\n```", "【代码见下方文件】", ans)
         
-        await status_msg.edit_text(f"<b>分析结果：</b>\n<pre>{text_only[:3500]}</pre>", parse_mode='HTML')
-
+        await status_msg.edit_text(f"<b>响应内容：</b>\n<pre>{clean_text[:3500]}</pre>", parse_mode='HTML')
+        
         for i, code in enumerate(blocks):
             name_match = re.search(r"#\s*filename:\s*([\w\.\-]+)", code)
-            fname = name_match.group(1) if name_match else f"solution_{i+1}.py"
+            fname = name_match.group(1) if name_match else f"output_{i+1}.py"
             f_io = io.BytesIO(code.encode('utf-8'))
             f_io.name = fname
             await context.bot.send_document(chat_id=update.effective_chat.id, document=f_io)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ 运行错误: {str(e)}")
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in authorized_users and str(uid) != str(ADMIN_ID):
-        await start(update, context)
-        return
-    
-    status_msg = await update.message.reply_text("📥 收到文件，正在深度读取内容...")
-    try:
-        doc = update.message.document
-        new_file = await context.bot.get_file(doc.file_id)
-        f_bytes = await new_file.download_as_bytearray()
-        content = f_bytes.decode('utf-8', errors='ignore')
-        caption = update.message.caption or "分析代码逻辑并给出重构建议"
-        await status_msg.delete()
-        await process_ai(update, context, f"【文件分析】文件名: {doc.file_name}\n内容:\n{content}\n要求: {caption}")
     except Exception as e:
-        await status_msg.edit_text(f"❌ 文件解析失败: {str(e)}")
+        await status_msg.edit_text(f"❌ 运行异常：{str(e)}")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # 为非技术用户增加一键处理文件分析
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_text)) # 复用逻辑
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
