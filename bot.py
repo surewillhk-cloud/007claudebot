@@ -8,7 +8,7 @@ from telegram.constants import ParseMode
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = os.getenv("ADMIN_ID")
-KEFU_URL = "https://t.me/your_kefu_id" # 替换为您的客服链接
+KEFU_URL = "https://t.me/ch007b" # 替换为您的客服链接
 
 # 内部状态
 current_model = "anthropic/claude-3.7-sonnet:thinking"
