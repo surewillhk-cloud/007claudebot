@@ -27,7 +27,7 @@ SYSTEM_PROMPT = """你是一个专业的全栈工程师。
 
 async def check_auth(update: Update):
     if update.effective_user.id not in authorized_users:
-        keyboard = [[InlineKeyboardButton("📩 联系客服申请授权", url="https://t.me/你的客服ID")]]
+        keyboard = [[InlineKeyboardButton("📩 联系客服申请授权", url="https://t.me/@ch007b")]]
         await update.message.reply_text("⛔ 您尚未获得授权。请输入激活密钥或联系客服。", reply_markup=InlineKeyboardMarkup(keyboard))
         return False
     return True
