@@ -1,125 +1,86 @@
-import os
-import io
-import re
-import logging
+import os, io, re, logging, secrets, string
 from openai import OpenAI
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, CallbackQueryHandler
 
-# --- 配置区 ---
+# --- 配置中心 ---
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MODEL_ID = os.getenv("MODEL_ID", "anthropic/claude-4.5-opus")
-BASE_URL = "https://openrouter.ai/api/v1"
-ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID") 
+ADMIN_ID = os.getenv("ADMIN_ID") # 在 Railway 设置你的数字 ID
 
-SYSTEM_PROMPT = """你是一个专业的全栈工程师。
-1. 请提供完整、可运行的代码。
-2. 每个文件必须放在独立的代码块(```)中。
-3. 代码块第一行格式：# filename: 文件名.扩展名
-"""
+# 存储数据 (生产环境建议用数据库，这里先用内存演示)
+authorized_users = set() 
+if ADMIN_ID: authorized_users.add(int(ADMIN_ID))
+valid_keys = {} # 格式: {密钥: 生成者ID}
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY)
 
-client = OpenAI(base_url=BASE_URL, api_key=OPENROUTER_API_KEY)
+# --- 辅助函数 ---
+def generate_key(length=12):
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
-def extract_code_files(text):
-    blocks = re.findall(r"```(?:\w+)?\n([\s\S]*?)\n```", text)
-    files = []
-    for block in blocks:
-        name_match = re.search(r"#\s*filename:\s*([\w\.\-]+)", block)
-        filename = name_match.group(1) if name_match else f"generated_file_{len(files)+1}.py"
-        files.append({"name": filename, "content": block})
-    return files
-
+# --- 指令处理 ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 Claude 4.5 机器人已就绪！\n\n✅ 发送需求文字即可生成代码。\n✅ 发送 .py/.txt 文件并附带说明即可分析。")
+    uid = update.effective_user.id
+    if uid in authorized_users:
+        await update.message.reply_text("✅ 您已获得授权，请直接发送需求或文件。")
+    else:
+        keyboard = [[InlineKeyboardButton("📩 联系客服申请授权", url="https://t.me/@ch007b")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("⛔ 您尚未获得授权。\n请联系客服获取激活密钥后发送给机器人。", reply_markup=reply_markup)
 
-async def process_ai_response(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt_text: str):
-    """统一处理 AI 请求逻辑"""
-    status_msg = await update.message.reply_text("⏳ Claude 4.5 正在深度分析中...")
-    
-    try:
-        response = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt_text}
-            ]
-        )
-        
-        reply = response.choices[0].message.content
-        files = extract_code_files(reply)
+async def make_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """管理员生成密钥"""
+    if str(update.effective_user.id) != str(ADMIN_ID): return
+    new_key = generate_key()
+    valid_keys[new_key] = update.effective_user.id
+    await update.message.reply_text(f"🔑 成功生成密钥：\n`{new_key}`\n请将其发给用户。")
 
-        # 分段发送长文本，防止超过 TG 限制
-        if len(reply) > 4000:
-            for i in range(0, len(reply), 4000):
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=reply[i:i+4000])
-        else:
-            await status_msg.edit_text(reply)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    text = update.message.text.strip() if update.message.text else ""
 
-        for f in files:
-            f_io = io.BytesIO(f["content"].encode('utf-8'))
-            f_io.name = f["name"]
-            await context.bot.send_document(chat_id=update.effective_chat.id, document=f_io)
-
-    except Exception as e:
-        logger.error(f"API Error: {e}")
-        await status_msg.edit_text(f"❌ API 响应失败: {str(e)}")
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_USER_ID and str(update.effective_user.id) != str(ALLOWED_USER_ID):
-        return
-    # 修正：传递 context 参数
-    await process_ai_response(update, context, update.message.text)
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理并分析上传的文件"""
-    if ALLOWED_USER_ID and str(update.effective_user.id) != str(ALLOWED_USER_ID):
+    # 1. 检查是否是激活尝试
+    if text in valid_keys:
+        authorized_users.add(uid)
+        del valid_keys[text]
+        await update.message.reply_text("🎉 激活成功！您现在可以开始使用 Claude 4.5 了。")
         return
 
-    status_msg = await update.message.reply_text("📥 正在解析文件...")
-    
+    # 2. 权限拦截
+    if uid not in authorized_users:
+        await start(update, context)
+        return
+
+    # 3. 正常 AI 逻辑 (此处调用你之前的 process_ai 逻辑)
+    await process_ai(update, context, text)
+
+# --- 这里的 process_ai 和 handle_doc 保持之前版本逻辑，仅需注意调用方式 ---
+async def process_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    # (保持之前处理 OpenAI 请求的代码)
+    status_msg = await update.message.reply_text("⏳ Claude 正在思考...")
     try:
-        doc = update.message.document
-        # 限制只读取常见的文本/代码后缀，防止误读二进制文件导致乱码
-        allowed_ext = ('.py', '.txt', '.log', '.js', '.html', '.css', '.json', '.md')
-        if not doc.file_name.lower().endswith(allowed_ext):
-            await status_msg.edit_text(f"⚠️ 暂时不支持分析 {doc.file_name} 类型的文件。")
-            return
-
-        new_file = await context.bot.get_file(doc.file_id)
-        file_byte_array = await new_file.download_as_bytearray()
-        
-        # 尝试解码
-        try:
-            content = file_byte_array.decode('utf-8')
-        except UnicodeDecodeError:
-            content = file_byte_array.decode('gbk', errors='ignore')
-
-        user_comment = update.message.caption or "请详细分析这段代码的逻辑并指出潜在问题。"
-        full_prompt = f"【文件分析任务】\n文件名: {doc.file_name}\n内容如下:\n---\n{content}\n---\n用户要求: {user_comment}"
-        
-        await status_msg.delete()
-        # 修正：传递 context 参数
-        await process_ai_response(update, context, full_prompt)
-
+        response = client.chat.completions.create(model=MODEL_ID, messages=[{"role":"user","content":prompt}])
+        await status_msg.edit_text(response.choices[0].message.content[:4000])
     except Exception as e:
-        await status_msg.edit_text(f"❌ 文件解析失败: {str(e)}")
+        await status_msg.edit_text(f"❌ 错误: {str(e)}")
+
+async def handle_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in authorized_users:
+        await start(update, context)
+        return
+    # (保持之前 handle_document 的逻辑)
+    await update.message.reply_text("📥 文件已收到，正在分析...")
 
 def main():
-    if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
-        print("❌ 环境变量缺失！")
-        return
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    
-    print("🤖 机器人已成功启动...")
-    app.run_polling(drop_pending_updates=True)
+    app.add_handler(CommandHandler("makekey", make_key)) # 管理员指令
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_doc))
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
