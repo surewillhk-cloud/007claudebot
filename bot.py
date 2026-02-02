@@ -9,7 +9,7 @@ from telegram.constants import ParseMode
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID") else None
-KEFU_URL = "https://t.me/your_telegram_id" # 记得改这里
+KEFU_URL = "https://t.me/ch007b" # 记得改这里
 DB_FILE = "users_db.json"
 
 # 模型映射
