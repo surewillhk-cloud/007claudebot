@@ -100,3 +100,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📊 官方总池余额：${bal}")
     elif text == "🛑 停止清理":
         context.user_data.clear()
+        await update.message.reply_text("⏹ 记忆已清空。")
+    elif str(uid) in db["users"] or uid == ADMIN_ID:
+        await run_ai(update, context, text)
+
+async def run_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    uid = update.effective_user.id
+    if "history" not in context.user_data: context.user_data["history"] = []
+    context.user_data["history"].append({"role": "user", "content": prompt})
+    
+    model = context.user_data.get("model", MODELS["💰 3.7 Sonnet"])
+    status = await update.message.reply_text("🔍 正在秒回...")
+    
+    try:
+        # 严格 System Prompt 指令：限制 AI 讲废话
+        sys_cmd = {"role": "system", "content": "你是一个极致精简的助手。严禁废话、严禁分析、严禁开场白。直接输出用户需要的结果。"}
+        
+        response = client.chat.completions.create(
+            model=model, 
+            messages=[sys_cmd] + context.user_data["history"][-6:]
+        )
+        ans = response.choices[0].message.content
+        
+        # 成本计算
+        cost = (response.usage.total_tokens / 1000) * 0.02
+        
+        footer = ""
+        if uid != ADMIN_ID:
+            db["users"][str(uid)]["balance"] -= cost
+            db["users"][str(uid)]["balance"] = max(0, db["users"][str(uid)]["balance"])
+            save_db(db)
+            # 用户端显示翻倍消耗，维持 10U 逻辑
+            footer = f"\n\n💸 消耗: ${round(cost*2, 4)} | 余额: ${round(db['users'][str(uid)]['balance']*2, 2)}"
+        
+        await status.edit_text(f"{ans}{footer}")
+        context.user_data["history"].append({"role": "assistant", "content": ans})
+    except Exception as e:
+        await status.edit_text(f"❌ 系统异常: {e}")
+
+if __name__ == "__main__":
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling(drop_pending_updates=True)
